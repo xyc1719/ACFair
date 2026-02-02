@@ -5,11 +5,13 @@ AI generated content without human review.
 import asyncio, time, json
 import httpx
 from datasets import load_dataset
+import pandas as pd
 
 PROXY = "http://127.0.0.1:9000/v1/chat/completions"
-NUM_REQUESTS = 32
+CSV_PATH = "../data/BurstGPT_simple.csv" # only 1k lines
+MAX_INFLIGHT = 200
 
-async def one(i: int, stream=True):
+async def one(client: httpx.AsyncClient, i: int, stream: bool = True):
     body = {
         "model": "Qwen/Qwen2.5-3B-Instruct",
         "messages": [{"role":"user","content": f"Give me a short tip about systems research. (req={i})"}],
@@ -29,20 +31,46 @@ async def one(i: int, stream=True):
                         continue
                     if line.startswith("data: "):
                         payload = line[len("data: "):]
-                        # print(payload, flush=True)
                         if ttft is None:
                             ttft = (time.perf_counter() - t0) * 1000
                         if payload.strip() == "[DONE]":
+                            dt = (time.perf_counter() - t0) * 1000
                             break
 
-            print(json.dumps({"i": i, "ttft_ms": ttft}, ensure_ascii=False))
+            print(json.dumps({"i": i, "ttft_ms": ttft, "e2e_ms": dt}, ensure_ascii=False))
         else:
             r = await client.post(PROXY, json=body)
             dt = (time.perf_counter() - t0) * 1000
             print("status", r.status_code, "e2e_ms", dt)
 
-async def main():
-    # 并发 请求
-    await asyncio.gather(*[one(i, stream=True) for i in range(NUM_REQUESTS)])
+async def schedule_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, i: int, delay_s: float):
+    if delay_s > 0:
+        await asyncio.sleep(delay_s)
 
-asyncio.run(main())
+    # 并发控制
+    async with sem:
+        await one(client, i, stream=True)
+
+
+async def main():
+    df = pd.read_csv(CSV_PATH, nrows=100)
+
+    if "Timestamp" not in df.columns:
+        raise ValueError(f"Can't find the column named 'Timestamp' in CSV。当前列: {list(df.columns)}")
+
+    ts = df["Timestamp"]
+    t0 = ts[0]
+
+    sem = asyncio.Semaphore(MAX_INFLIGHT)
+
+    async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
+        tasks = []
+        for idx, t in enumerate(ts):
+            delay_s = (t - t0) / 100.0
+            tasks.append(asyncio.create_task(schedule_one(client, sem, idx, delay_s)))
+
+        await asyncio.gather(*tasks)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
