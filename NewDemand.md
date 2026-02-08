@@ -14,7 +14,7 @@
 - simple pending queue
 - TPM and VTC admission control
 - Measurement-Driven Fair Admission Control
-- several baseline: vLLM/Sarathi/TPM/VTC/*HTB*/...
+- several baseline: FCFS(vLLM/Sarathi)/TPM/VTC/*HTB*/...
 
 # User label synthesis
 

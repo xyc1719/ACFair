@@ -31,8 +31,18 @@ generate request follow Timestamp/100.0 ms, all request prompts are barely same.
 
 succeed!
 
+---
+
+**0208**
+
 ## measure and check component
 
-draft: at admission_proxy, monitoring vLLM performance(KV cache, input/output token and cost). check if it's satisfy the SLO.
+status monitor of input/output token usage and KV cache occupation at user level.
 
-have to skim the vLLM document and query AI for help.
+## Output token prediction
+
+According to historical distribution, make the prediction at P90/P95.
+
+---
+
+simple admission control policy
