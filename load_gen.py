@@ -17,7 +17,7 @@ async def one(client: httpx.AsyncClient, i: int, stream: bool = True):
         "user": f"user_{i%10}",  # 模拟 10 个用户轮流发请求 TODO: 可根据实际 分布 结构调整 user_id 的提取方式
         "model": "Qwen/Qwen2.5-3B-Instruct",
         "messages": [{"role":"user","content": f"Give me a short tip about systems research. (req={i})"}],
-        "max_tokens": 128,
+        "max_tokens": 2048,
         "stream": stream,
     }
     t0 = time.perf_counter()
@@ -54,7 +54,7 @@ async def schedule_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, i: int
 
 
 async def main():
-    df = pd.read_csv(CSV_PATH, nrows=100)
+    df = pd.read_csv(CSV_PATH, nrows=3000)
 
     if "Timestamp" not in df.columns:
         raise ValueError(f"Can't find the column named 'Timestamp' in CSV。当前列: {list(df.columns)}")
@@ -67,7 +67,8 @@ async def main():
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         tasks = []
         for idx, t in enumerate(ts):
-            delay_s = (t - t0) / 100.0
+            # default (t - t0) / 100
+            delay_s = (t - t0) / 1000.0
             tasks.append(asyncio.create_task(schedule_one(client, sem, idx, delay_s)))
 
         await asyncio.gather(*tasks)

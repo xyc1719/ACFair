@@ -12,10 +12,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 VLLM_BASE = "http://127.0.0.1:8000"
-MAX_INFLIGHT = 8
+MAX_INFLIGHT = 32
 DEFAULT_TTFT_SLO_MS = 500  # 默认 TTFT SLO（ms），可按需调整
 DEFAULT_TPOT_SLO_MS = 100  # 默认 TPOT SLO（ms），可按需调整
 KV_CACHE_BYTES_PER_TOKEN = 100000  # 每个 token 的 KV cache 估算字节数（粗略值，实际可根据模型调整）
+KV_CACHE_CAPACITY = 0.5 * 1024 * 1024 * 1024  # KV cache 总容量上限（字节），当前环境
 
 # in-memory per-user token counters (simple, not persisted)
 user_token_stats = {}
@@ -113,15 +114,15 @@ def record_user_tokens(user_id: str, input_tokens: int = 0, output_tokens: int =
     s["input"] += input_tokens
     s["output"] += output_tokens
 
-def record_user_KV_cache(user_id: str, kv_cache_bytes: int):
+def record_user_KV_cache(user_id: str, kv_cache_bytes: int = 0):
     s = user_KV_cache_stats.setdefault(user_id, {"kv_cache_bytes": 0})
     s["kv_cache_bytes"] += kv_cache_bytes
 
 historical_KV_cache = []
 
-def historical_KVcache_estimator(user_id: str, input_tokens: int, max_output_tokens: int = 128):
+def historical_KVcache_estimator(input_tokens: int, max_output_tokens: int = 2048):
     """基于历史 KV cache 数据计算 P90/P95 峰值估算"""
-    if len(historical_KV_cache)<5:
+    if len(historical_KV_cache)<10:
         # 缺少历史数据，返回保守估计
         return int((input_tokens + max_output_tokens) * KV_CACHE_BYTES_PER_TOKEN)
 
@@ -133,6 +134,70 @@ def historical_KVcache_estimator(user_id: str, input_tokens: int, max_output_tok
     p90_kv_bytes = percentile(historical_KV_cache, 90)
     return p90_kv_bytes 
 
+import re
+METRICS_URL = f"{VLLM_BASE}/metrics"
+HEADROOM_RATIO = 0.10
+
+reserved_kv_bytes = 0
+reserved_lock = asyncio.Lock()
+
+_metric_line_re = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+([0-9\.eE\+\-]+)\s*$')
+async def get_kv_cache_usage_ratio() -> float | None:
+    # kv_cache_usage_ratio \in [0.0, 1.0]
+    async with httpx.AsyncClient(timeout=1.0, trust_env=False) as c:
+        r = await c.get(METRICS_URL)
+        r.raise_for_status()
+        text = r.text
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _metric_line_re.match(line)
+        if not m:
+            continue
+        name, _, value_str = m.group(1), m.group(2), m.group(3)
+
+        if name != "vllm:kv_cache_usage_perc":
+            continue
+
+        val = float(value_str)
+        # clamp
+        return max(0.0, min(1.0, val))
+
+    return None
+
+async def admit_or_reject(body: dict, prompt_tokens: int) -> tuple[bool, int, dict]:
+    """
+    return (admit?, predicted_bytes, debug_info)
+    """
+    global reserved_kv_bytes
+
+    pred = historical_KVcache_estimator(prompt_tokens, body.get("max_tokens", 2048))
+
+    usage = await get_kv_cache_usage_ratio()
+    if usage is None:
+        return (False, pred, {"reason": "no_metrics"})
+
+    used = int(usage * KV_CACHE_CAPACITY)
+    free = int(KV_CACHE_CAPACITY - used)
+    headroom = int(KV_CACHE_CAPACITY * HEADROOM_RATIO)
+
+    async with reserved_lock:
+        available = free - headroom - reserved_kv_bytes
+        if pred <= available:
+            reserved_kv_bytes += pred
+            return (True, pred, {
+                "usage": usage, "used": used, "free": free,
+                "headroom": headroom, "reserved_after": reserved_kv_bytes,
+                "pred": pred, "available_before": available
+            })
+        return (False, pred, {
+            "usage": usage, "used": used, "free": free,
+            "headroom": headroom, "reserved": reserved_kv_bytes,
+            "pred": pred, "available": available,
+            "reason": "kv_insufficient"
+        })
 '''
 Main entry point
 '''
@@ -161,6 +226,16 @@ async def chat_completions(req: Request):
 
     await sema.acquire()
     admitted_at = now_ms()
+    admitted, pred, dbg = await admit_or_reject(body, estimate_tokens(body.get("messages", [{}])[0].get("content", "")))
+    if not admitted:
+        sema.release()
+        print(json.dumps({"admitted": False, **dbg}, ensure_ascii=False))
+        return JSONResponse(
+            status_code=429,
+            content={"error": {"message": "Rejected by admission control (KV cache constraints)."}}
+        )
+    else:
+        print(json.dumps({"admitted_at_ms": admitted_at, "predicted_kv_cache_bytes": pred, **dbg}, ensure_ascii=False))
 
     async def _release():
         sema.release()
@@ -174,7 +249,8 @@ async def chat_completions(req: Request):
     chunk_intervals_ms = []
 
     async def stream_generator():
-        nonlocal first_chunk_time, last_chunk_time
+        nonlocal first_chunk_time, last_chunk_time, pred
+        global reserved_kv_bytes
         # initialize variables to avoid UnboundLocalError in finally block
         user_id = None
         kv_cache_bytes_est = 0
@@ -183,13 +259,9 @@ async def chat_completions(req: Request):
         try:
             # extract user id
             user_id = body.get("user")
-            #TODO:基于历史的KV cache 占用估算 P90/P95
-            peak_kv_cache_est = historical_KVcache_estimator(user_id, input_tokens_est,128)
-            # estimate input tokens from message prompt (rough)
-            msgs = body.get("messages") or []
-            for m in msgs:
-                if isinstance(m, dict):
-                    input_tokens_est += estimate_tokens(m.get("content", ""))
+            #基于历史的KV cache 估算 P90/P95
+            peak_kv_cache_est = pred
+            input_tokens_est = estimate_tokens(body.get("messages", [{}])[0].get("content", ""))
             kv_cache_bytes_est = int(input_tokens_est * KV_CACHE_BYTES_PER_TOKEN)
             # record input tokens immediately
             record_user_tokens(user_id, input_tokens=input_tokens_est)
@@ -229,6 +301,10 @@ async def chat_completions(req: Request):
                                         content = delta.get("content")
                                         if content:
                                             out_toks = estimate_tokens(content)
+                                            # update reserved KV cache
+                                            if kv_cache_bytes_est < peak_kv_cache_est:
+                                                async with reserved_lock:
+                                                    reserved_kv_bytes = max(0,reserved_kv_bytes - min(out_toks * KV_CACHE_BYTES_PER_TOKEN, peak_kv_cache_est - kv_cache_bytes_est))
                                             kv_cache_bytes_est += out_toks * KV_CACHE_BYTES_PER_TOKEN
                                             record_user_tokens(user_id, output_tokens=out_toks)
                                             record_user_KV_cache(user_id, out_toks * KV_CACHE_BYTES_PER_TOKEN)
@@ -251,6 +327,9 @@ async def chat_completions(req: Request):
             await _release()
             record_user_KV_cache(user_id, -kv_cache_bytes_est)
             historical_KV_cache.append(kv_cache_bytes_est)
+            if kv_cache_bytes_est < peak_kv_cache_est:
+                async with reserved_lock:
+                    reserved_kv_bytes = max(0,reserved_kv_bytes - ( peak_kv_cache_est - kv_cache_bytes_est))
 
             end = time.perf_counter()
             ttft_ms = None if first_chunk_time is None else (first_chunk_time - start) * 1000

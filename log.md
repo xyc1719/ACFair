@@ -46,3 +46,60 @@ According to historical distribution, make the prediction at P90/P95.
 ---
 
 simple admission control policy
+
+# 0211
+
+## TODOLIST
+
+- 矫正KV cache和token usage的实时性监测
+- 固定vLLM KV cache memory bytes，能正确的监测KVcache占用比，并进行可行性准入。
+- 准入队列，简单的等待超时(429)
+  - 超参数
+  - future work可使用TTFT estimator，根据历史开销进行优化（EMA平滑）。
+- VTC策略实现
+- TPM策略实现
+
+## KV cache和token usage实时性监测
+
+asyncio/await 为轮询实现，伪多线程，不存在写入竞争，over。
+
+## 固定KV cache，实现可行性准入
+
+通过 `--kv-cache-memory-bytes 5g`限制KV cache占用，warm up时会提示对应的max_num_token参数（135,632 tokens）。
+
+设置固定KV cache大小，和max_model_len和max_num_seqs的乘积有关，但是该乘积也会增加其他开销（如计算图）。大致为memory = model + KV cache(context, reqs) + other(context, reqs)。
+
+`kv_cache_usage_perc` 指标表示KV cache整体占用。
+
+非防止临时大量请求准入，导致KV cache占用偏差，引入reserved_kv_cache占位并随request处理而更新。**隐含风险**：reserved_lock同步速度较慢。
+
+可行性准入条件为free- headroom -reserved >= pred。
+
+### 测试
+
+在不改变prompt输入时，需要调整部分代码使得，KV constraint变得明显。
+
+1. vllm: `--no-enable-prefix-caching` KV cache 5g ->0.5g
+2. admission_proxy: KV cache 5g -> 0.5g
+3. load_gen: time /100 -> time /1000
+
+但在开始一些prompt之后，KV cache不再成为约束点，可能的原因是total token length太短（使用估计器后跑不满占用）
+
+## 准入队列
+
+
+---
+
+*remain:
+
+- +变长prompt
+  - 对应数据集
+  - 早停策略或WildChat
+  - 
+- -用户标签合成
+  - 好的分布
+  - 分析论证的文档（英文两段），附带引用文献
+  - load_gen.py调整
+- +动态TPM (优化策略的实现)，测试
+- 针对4个指标，记录实验结果并优化
+- outline流程示意图
