@@ -15,12 +15,12 @@ VLLM_BASE = "http://127.0.0.1:8000"
 MAX_INFLIGHT = 32
 DEFAULT_TTFT_SLO_MS = 500  # 默认 TTFT SLO（ms），可按需调整
 DEFAULT_TPOT_SLO_MS = 50  # 默认 TPOT SLO（ms），可按需调整
-DEFAULT_QUEUE_WAIT_MS = 100000 # TODO: 超参数控制最大排队等待时间，超过则直接拒绝（ms），后续使用TTFT estimator优化
+DEFAULT_QUEUE_WAIT_MS = 100 # TODO: 超参数控制最大排队等待时间，超过则直接拒绝（ms），后续使用TTFT estimator优化
 KV_CACHE_BYTES_PER_TOKEN = 100000  # 每个 token 的 KV cache 估算字节数（粗略值，实际可根据模型调整）
-KV_CACHE_CAPACITY = 0.5 * 1024 * 1024 * 1024  # KV cache 总容量上限（字节），当前环境
-MAX_PENDING_QUEUE_SIZE = 1000  # TODO: 超参数控制队列长度上限，超过则直接拒绝
+KV_CACHE_CAPACITY = 5 * 1024 * 1024 * 1024  # KV cache 总容量上限（字节），当前环境
+MAX_PENDING_QUEUE_SIZE = 100  # TODO: 超参数控制队列长度上限，超过则直接拒绝
 
-DEFAULT_TPM_QUOTA = 1000000  # 每分钟最大 token 数配额（全局），可按需调整
+DEFAULT_TPM_QUOTA = 1000*60  # 每分钟最大 token 数配额（全局），可按需调整
 user_TPM_stats = {}  # in-memory per-user TPM
 
 # in-memory per-user token counters (simple, not persisted)
@@ -133,6 +133,32 @@ def record_user_TPM(user_id: str, token_count: int):
     stats["history"].append((now, token_count))
     stats["total"] += token_count
 
+user_VTC_stats={}
+def get_user_VTC(user_id: str):
+    user_VTC_stats.setdefault(user_id,{"active":0, "VTC": 0})
+    return user_VTC_stats[user_id]['VTC']
+
+def record_user_VTC(user_id: str, token_count: int):
+    user_VTC_stats.setdefault(user_id,{"active":0, "VTC": 0})
+    user_VTC_stats[user_id]["VTC"]+=token_count
+
+def get_min_user_VTC():
+    flag = False
+    min_VTC = 0
+    for i, (key,value) in enumerate(user_VTC_stats.items()):
+        if value["active"] >0:
+            if not flag:
+                min_VTC = value["VTC"]
+                flag = True
+            else:
+                min_VTC = min(min_VTC,value["VTC"])
+    return min_VTC
+
+def set_user_VTC(user_id:str,token_count: int):
+    user_VTC_stats.setdefault(user_id,{"active":0, "VTC": 0})
+    user_VTC_stats[user_id]["VTC"]= token_count
+
+
 def record_user_tokens(user_id: str, input_tokens: int = 0, output_tokens: int = 0):
     s = user_token_stats.setdefault(user_id, {"input": 0, "output": 0})
     s["input"] += input_tokens
@@ -155,6 +181,7 @@ def historical_KVcache_estimator(input_tokens: int, max_output_tokens: int = 204
         historical_KV_cache.pop(0)
 
     # 计算 P90 作为准入的保守估计
+    #TODO: 针对不同prompt长度，分桶p90。或者线性估计
     p90_kv_bytes = percentile(historical_KV_cache, 90)
     return p90_kv_bytes 
 
@@ -277,7 +304,6 @@ async def dispatcher_loop():
 async def dispatcher_loop_TPM():
     global seq_counter
     while True:
-        print("alive tick...")
         async with queue_cv:
             # after notify, check if queue is non-empty
             while not pending_queue:
@@ -290,7 +316,7 @@ async def dispatcher_loop_TPM():
                 arrival_ms, ddl_ms, item = pending_queue[i]
                 if now > ddl_ms:
                     pending_queue.pop(i)
-                    item.reject_reason = "waiting_time_exceeded"
+                    item.reject_reason = "waiting_time_exceeded(TPM)"
                     item.start_event.set()
                     continue
                 i += 1
@@ -309,6 +335,7 @@ async def dispatcher_loop_TPM():
                     item.start_event.set()
                     continue
                 user_TPM = get_user_TPM(user_id)
+                #TODO: 限制超过TPM用户，直到他的请求超时，或者TPM下降
                 if user_TPM + item.input_tokens_est <= DEFAULT_TPM_QUOTA:
                     admitted, pred, dbg = await admit_or_reject(item.body, item.input_tokens_est,item.predicted_kv_bytes)
                     # if admitted 
@@ -317,8 +344,6 @@ async def dispatcher_loop_TPM():
                         item.admitted_dbg = {"predicted_kv_cache_bytes": pred, **dbg}
                         selected_item = item
                         break
-                    else:
-                        print("lack KV resource for request from user_id=", user_id)
                 i += 1
 
         #setup stream generator
@@ -326,10 +351,64 @@ async def dispatcher_loop_TPM():
             await sema.acquire()
             selected_item.start_event.set()
         else:
-            print("no admissible request, wait for next tick...")
-            sleep_time = 0.05  # 50ms 后重试
-            await asyncio.sleep(sleep_time)
+            # lack of TPM or resources, waiting for new request/ request exit/ timer tick.
+            await queue_cv.wait()
+            continue
 
+async def dispatcher_loop_VTC():
+    global seq_counter
+    while True:
+        print("alive tick...")
+        async with queue_cv:
+            # after notify, check if queue is non-empty
+            while not pending_queue:
+                await queue_cv.wait()
+
+            # clean up expired requests.
+            now = now_ms()
+            i = 0
+            while i < len(pending_queue):
+                arrival_ms, ddl_ms, item = pending_queue[i]
+                if now > ddl_ms:
+                    pending_queue.pop(i)
+                    item.reject_reason = "waiting_time_exceeded(VTC)"
+                    item.start_event.set()
+                    continue
+                i += 1
+            if not pending_queue:
+                continue
+
+            # check admit or reject
+            selected_idx = 0
+            min_VTC = 1<<32
+            for i in range(len(pending_queue)):
+                arrival_ms, ddl_ms, item = pending_queue[i]
+                user_id = item.body.get("user")
+                if not user_id:
+                    pending_queue.pop(i)
+                    item.reject_reason = "missing_user_id"
+                    item.start_event.set()
+                    continue
+
+                if(get_user_VTC(user_id)<min_VTC):
+                    selected_idx=i
+                    min_VTC = get_user_VTC(user_id)
+            arrival_ms, ddl_ms,item = pending_queue[selected_idx]
+            # check admit or reject
+            admitted, pred, dbg = await admit_or_reject(item.body, item.input_tokens_est,item.predicted_kv_bytes)
+            if not admitted:
+                # lack of resources, try again later
+                await queue_cv.wait()
+                continue
+  
+            # admitted 
+            pending_queue.pop(selected_idx)
+            item.admitted_dbg = {"predicted_kv_cache_bytes": pred, **dbg}
+
+        #setup stream generator
+        await sema.acquire()
+        item.start_event.set()
+                 
 
 async def deadline_tick():
     # timer for waiting time exceeded rejection
@@ -353,7 +432,8 @@ app = FastAPI()
 sema = asyncio.Semaphore(MAX_INFLIGHT)
 @app.on_event("startup")
 async def _startup():
-    asyncio.create_task(dispatcher_loop())
+    asyncio.create_task(dispatcher_loop_VTC())
+    asyncio.create_task(deadline_tick())
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
@@ -399,6 +479,11 @@ async def chat_completions(req: Request):
             )
         # else:
         #     print(len(pending_queue), seq_counter)
+        user_id = body.get("user")
+        #new user, align the VTC to minimal active user.
+        get_user_VTC(user_id)
+        if user_VTC_stats[body.get("user")]["active"]== 0:
+            set_user_VTC(user_id,get_min_user_VTC())
         pending_queue.append((now_ms(), now_ms() + DEFAULT_QUEUE_WAIT_MS, item))
         seq_counter += 1
         queue_cv.notify_all()
@@ -425,7 +510,9 @@ async def chat_completions(req: Request):
             # record input tokens immediately
             record_user_tokens(user_id, input_tokens=input_tokens_est)
             record_user_KV_cache(user_id, kv_cache_bytes=kv_cache_bytes_est)
-            # record_user_TPM(user_id, input_tokens_est)
+            record_user_TPM(user_id, input_tokens_est)
+            record_user_VTC(user_id, input_tokens_est)
+            user_VTC_stats[user_id]['active']+=1
 
             async with client.stream(
                 "POST",
@@ -468,7 +555,8 @@ async def chat_completions(req: Request):
                                             kv_cache_bytes_est += out_toks * KV_CACHE_BYTES_PER_TOKEN
                                             record_user_tokens(user_id, output_tokens=out_toks)
                                             record_user_KV_cache(user_id, out_toks * KV_CACHE_BYTES_PER_TOKEN)
-                                            # record_user_TPM(user_id, out_toks* IO_TOKEN_WEIGHT_RATIO)
+                                            record_user_TPM(user_id, out_toks* IO_TOKEN_WEIGHT_RATIO)
+                                            record_user_VTC(user_id, out_toks* IO_TOKEN_WEIGHT_RATIO)
                         except Exception:
                             # ignore parse errors
                             pass
@@ -486,6 +574,7 @@ async def chat_completions(req: Request):
         finally:
             await client.aclose()
             sema.release()
+            user_VTC_stats[user_id]['active']=max(0,user_VTC_stats[user_id]['active']-1)
             # Request terminated, notify dispatcher and check the feasibility of new request.
             async with queue_cv:
                 queue_cv.notify_all()

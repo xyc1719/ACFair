@@ -117,15 +117,41 @@ QueueItem + dispatcher(Item in / finish) + deadline_tick(50 ms recall dispatcher
 
 ## TODOLIST
 
+- 准入队列 3 over
+- VTC策略实现 2 over
+- TPM策略实现 1 over
 - 合成prompt 2
-- 准入队列 3
-- VTC策略实现 2
-- TPM策略实现 1
 - *用户标签合成 3
 - 动态TPM策略实现 3
+
+## 准入队列
+
+见上文
+
+## TPM策略实现
+
+超出quota时等待，否则判断KVcache是否允许准入。超额用户的请求可能被超时清退。
+
+## VTC策略实现
+
+每次选取VTC最小值，判断是否允许准入，否则继续等待。不公平用户请求可能被超时清退。
+
+对于新用户，和最小的活跃用户对齐。
+
+**风险**：公平性未进行充分测试。
+
+---
 
 ## 合成Prompt
 
 Draft:对于这类缺少对应Prompt的数据，通用的做法是合成。合成input len等长的Prompt，拒绝EOS早停，并限制对单个request限制最大output len
 
-## TPM策略实现
+load_gen调整,*vllm启动参数调整*
+
+## 用户标签合成
+
+arxiv data storage fair -> twitter/... 分布分析，学习分析思路
+
+=>查找分析大模型服务的类似用户请求分布 ->**形成{分布z， 分布分析文档（英文两段）， 引用}**
+
+=> rewrite load_gen.py
