@@ -15,12 +15,9 @@ VLLM_BASE = "http://127.0.0.1:8000"
 MAX_INFLIGHT = 32
 DEFAULT_TTFT_SLO_MS = 500  # 默认 TTFT SLO（ms），可按需调整
 DEFAULT_TPOT_SLO_MS = 50  # 默认 TPOT SLO（ms），可按需调整
-DEFAULT_QUEUE_WAIT_MS = 100 # TODO: 超参数控制最大排队等待时间，超过则直接拒绝（ms），后续使用TTFT estimator优化
+DEFAULT_QUEUE_WAIT_MS = 300 # TODO: 超参数控制最大排队等待时间，超过则直接拒绝（ms），后续使用TTFT estimator优化
 KV_CACHE_BYTES_PER_TOKEN = 100000  # 每个 token 的 KV cache 估算字节数（粗略值，实际可根据模型调整）
 KV_CACHE_CAPACITY = 0.5 * 1024 * 1024 * 1024  # KV cache 总容量上限（字节），当前环境
-MAX_PENDING_QUEUE_SIZE = 1000  # TODO: 超参数控制队列长度上限，超过则直接拒绝
-
-DEFAULT_TPM_QUOTA = 1000  # 每分钟最大 token 数配额（全局），可按需调整
 
 # in-memory per-user token counters (simple, not persisted)
 user_token_stats = {}
@@ -173,14 +170,13 @@ async def get_kv_cache_usage_ratio() -> float | None:
 
     return None
 
-async def admit_or_reject(body: dict, prompt_tokens: int,pred: int = None) -> tuple[bool, int, dict]:
+async def admit_or_reject(body: dict, prompt_tokens: int) -> tuple[bool, int, dict]:
     """
     return (admit?, predicted_bytes, debug_info)
     """
     global reserved_kv_bytes
 
-    if pred is None:
-        pred = historical_KVcache_estimator(prompt_tokens, body.get("max_tokens", 2048))
+    pred = historical_KVcache_estimator(prompt_tokens, body.get("max_tokens", 2048))
 
     usage = await get_kv_cache_usage_ratio()
     if usage is None:
@@ -205,63 +201,6 @@ async def admit_or_reject(body: dict, prompt_tokens: int,pred: int = None) -> tu
             "pred": pred, "available": available,
             "reason": "kv_insufficient"
         })
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
-
-@dataclass
-class QueueItem:
-    body: Dict[str, Any]
-    arrival_ms: int
-    input_tokens_est: int
-    predicted_kv_bytes: int
-
-    start_event: asyncio.Event = field(default_factory=asyncio.Event)
-    reject_reason: Optional[str] = None
-    admitted_dbg: Optional[Dict[str, Any]] = None
-
-pending_queue = []  # elements: ( arrival_ms, ddl_ms, QueueItem )
-queue_lock = asyncio.Lock()
-queue_cv = asyncio.Condition(queue_lock)
-seq_counter = 0
-
-async def dispatcher_loop():
-    global seq_counter
-    while True:
-        async with queue_cv:
-            # after notify, check if queue is non-empty
-            while not pending_queue:
-                await queue_cv.wait()
-
-            # FCFS version
-            arrival_ms, ddl_ms, item = pending_queue[0]
-            now = now_ms()
-            if now > ddl_ms:
-                pending_queue.pop(0)
-                item.reject_reason = "waiting_time_exceeded"
-                item.start_event.set()
-                continue
-
-            # 只尝试队首准入
-            admitted, pred, dbg = await admit_or_reject(item.body, item.input_tokens_est,item.predicted_kv_bytes)
-            if not admitted:
-                # 不动队列，等“资源变化/请求结束”再重试
-                await queue_cv.wait()
-                continue
-
-            # 能准入：出队 + 占用执行槽 + 放行
-            pending_queue.pop(0)
-            item.admitted_dbg = {"predicted_kv_cache_bytes": pred, **dbg}
-
-        # 注意：不要在持锁期间 acquire sema（避免卡死）
-        await sema.acquire()
-        item.start_event.set()
-
-async def deadline_tick():
-    # timer for waiting time exceeded rejection
-    while True:
-        await asyncio.sleep(0.05)  # 50ms
-        async with queue_cv:
-            queue_cv.notify_all()
 
 '''
 Main entry point
@@ -276,9 +215,6 @@ KV_CACHE_BYTES_PER_TOKEN = info["bytes_per_block_total_all_gpus"]//16
 
 app = FastAPI()
 sema = asyncio.Semaphore(MAX_INFLIGHT)
-@app.on_event("startup")
-async def _startup():
-    asyncio.create_task(dispatcher_loop())
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
@@ -286,56 +222,40 @@ async def chat_completions(req: Request):
     stream = bool(body.get("stream", False))
 
     # no pending queue; reject immediately if at capacity
-    # if sema.locked() and sema._value == 0:
-    #     return JSONResponse(
-    #         status_code=429,
-    #         content={"error": {"message": "Rejected by admission control (over capacity)."}}
-    #     )
+    if sema.locked() and sema._value == 0:
+        return JSONResponse(
+            status_code=429,
+            content={"error": {"message": "Rejected by admission control (over capacity)."}}
+        )
 
-    # await sema.acquire()
-    # admitted_at = now_ms()
-    # admitted, pred, dbg = await admit_or_reject(body, estimate_tokens(body.get("messages", [{}])[0].get("content", "")))
-    # if not admitted:
-    #     sema.release()
-    #     print(json.dumps({"admitted": False, **dbg}, ensure_ascii=False))
-    #     return JSONResponse(
-    #         status_code=429,
-    #         content={"error": {"message": "Rejected by admission control (KV cache constraints)."}}
-    #     )
-    # else:
-    #     print(json.dumps({"admitted_at_ms": admitted_at, "predicted_kv_cache_bytes": pred, **dbg}, ensure_ascii=False))
+    await sema.acquire()
+    admitted_at = now_ms()
+    admitted, pred, dbg = await admit_or_reject(body, estimate_tokens(body.get("messages", [{}])[0].get("content", "")))
+    if not admitted:
+        sema.release()
+        print(json.dumps({"admitted": False, **dbg}, ensure_ascii=False))
+        return JSONResponse(
+            status_code=429,
+            content={"error": {"message": "Rejected by admission control (KV cache constraints)."}}
+        )
+    else:
+        print(json.dumps({"admitted_at_ms": admitted_at, "predicted_kv_cache_bytes": pred, **dbg}, ensure_ascii=False))
 
-    # async def _release():
-    #     sema.release()
+    async def _release():
+        sema.release()
 
-    item:QueueItem = QueueItem(
-        body=body,
-        arrival_ms=now_ms(),
-        input_tokens_est=estimate_tokens(body.get("messages", [{}])[0].get("content", "")),
-        predicted_kv_bytes=historical_KVcache_estimator(estimate_tokens(body.get("messages", [{}])[0].get("content", "")), body.get("max_tokens", 2048))
-    )
-    # new request enqueue and notify dispatcher
-    global seq_counter
-    async with queue_cv:
-        if len(pending_queue) >= MAX_PENDING_QUEUE_SIZE: # TODO: 超参数控制队列长度上限，超过则直接拒绝
-            return JSONResponse(
-                status_code=429,
-                content={"error": {"message": "Rejected by admission control (queue full)."}}
-            )
-        # else:
-        #     print(len(pending_queue), seq_counter)
-        pending_queue.append((now_ms(), now_ms() + DEFAULT_QUEUE_WAIT_MS, item))
-        seq_counter += 1
-        queue_cv.notify_all()
+    # --- Forward to vLLM ---
+    client = httpx.AsyncClient(timeout=None, trust_env=False)
 
-    async def stream_generator(item: QueueItem):
-        client = httpx.AsyncClient(timeout=None, trust_env=False)
+    start = time.perf_counter()
+    first_chunk_time = None
+    last_chunk_time = None
+    chunk_intervals_ms = []
 
+    async def stream_generator():
+        nonlocal first_chunk_time, last_chunk_time, pred
         global reserved_kv_bytes
-        start = time.perf_counter()
-        first_chunk_time = None
-        last_chunk_time = None
-        chunk_intervals_ms = []
+        # initialize variables to avoid UnboundLocalError in finally block
         user_id = None
         kv_cache_bytes_est = 0
         input_tokens_est = 0
@@ -344,12 +264,12 @@ async def chat_completions(req: Request):
             # extract user id
             user_id = body.get("user")
             #基于历史的KV cache 估算 P90/P95
-            peak_kv_cache_est = item.predicted_kv_bytes
-            input_tokens_est = item.input_tokens_est
+            peak_kv_cache_est = pred
+            input_tokens_est = estimate_tokens(body.get("messages", [{}])[0].get("content", ""))
             kv_cache_bytes_est = int(input_tokens_est * KV_CACHE_BYTES_PER_TOKEN)
             # record input tokens immediately
             record_user_tokens(user_id, input_tokens=input_tokens_est)
-            record_user_KV_cache(user_id, kv_cache_bytes=kv_cache_bytes_est)
+            record_user_KV_cache(user_id, int(input_tokens_est * KV_CACHE_BYTES_PER_TOKEN))
 
             async with client.stream(
                 "POST",
@@ -408,13 +328,9 @@ async def chat_completions(req: Request):
                         yield (line + "\n").encode("utf-8")
         finally:
             await client.aclose()
-            sema.release()
-            # Request terminated, notify dispatcher and check the feasibility of new request.
-            async with queue_cv:
-                queue_cv.notify_all()
+            await _release()
             record_user_KV_cache(user_id, -kv_cache_bytes_est)
             historical_KV_cache.append(kv_cache_bytes_est)
-            # release reserved KV cache
             if kv_cache_bytes_est < peak_kv_cache_est:
                 async with reserved_lock:
                     reserved_kv_bytes = max(0,reserved_kv_bytes - ( peak_kv_cache_est - kv_cache_bytes_est))
@@ -425,7 +341,7 @@ async def chat_completions(req: Request):
 
             # assemble per-request metrics including KV cache estimate and SLO result
             metrics = {
-                "admitted_at_ms": item.arrival_ms,
+                "admitted_at_ms": admitted_at,
                 "stream": stream,
                 "ttft_ms": ttft_ms,
                 "e2e_ms": e2e_ms,
@@ -450,19 +366,21 @@ async def chat_completions(req: Request):
                 pass
 
     if stream:
-        # 1) 等 dispatcher 放行或拒绝
-        await item.start_event.wait()
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
-        # 2) 如果是被拒绝唤醒：直接返回 SSE 错误并结束
-        if item.reject_reason:
-            return JSONResponse(
-        status_code=429,
-        content={"error": {"message": item.reject_reason}})
-            
-        # --- Forward to vLLM ---
-        return StreamingResponse(stream_generator(item=item), media_type="text/event-stream")
-    else:
-        pass
+    # non-stream: simpler but weaker.
+    try:
+        r = await client.post(f"{VLLM_BASE}/v1/chat/completions", json=body)
+        r.raise_for_status()
+        data = r.json()
+        end = time.perf_counter()
+        e2e_ms = (end - start) * 1000
+        # 
+        print(json.dumps({"admitted_at_ms": admitted_at, "stream": False, "e2e_ms": e2e_ms, "rejected": False}, ensure_ascii=False))
+        return JSONResponse(content=data)
+    finally:
+        await client.aclose()
+        await _release()
 
 def percentile(arr:list, p):
     if arr is None or len(arr) == 0:

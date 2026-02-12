@@ -1,11 +1,31 @@
-import re
+async def dispatcher_loop():
+    global seq_counter
+    while True:
+        async with queue_cv:
+            # 等到队列非空
+            while not queue_heap:
+                await queue_cv.wait()
 
-_metric_line_re = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+([0-9\.eE\+\-]+)\s*$')
+            # 有队列，先清理过期（只需要清理队首即可，因为我们只允许队首出队）
+            neg_p, arrival_ms, seq, item = queue_heap[0]
+            now = now_ms()
+            if now > item.ddl_ms:
+                heapq.heappop(queue_heap)
+                item.reject_reason = "deadline_exceeded_in_queue"
+                item.start_event.set()
+                continue
 
-line = 'vllm:kv_cache_usage_perc{engine="0",model_name="Qwen/Qwen2.5-3B-Instruct"} 0.0'
+            # 只尝试队首准入
+            admitted, pred, dbg = await admit_or_reject(item.body, item.input_tokens_est)
+            if not admitted:
+                # 不动队列，等“资源变化/请求结束”再重试
+                await queue_cv.wait()
+                continue
 
-m = _metric_line_re.match(line)
-if not m:
-    exit(429)
-name, _, value_str = m.group(1), m.group(2), m.group(3)
-print (name,value_str)
+            # 能准入：出队 + 占用执行槽 + 放行
+            heapq.heappop(queue_heap)
+            item.admitted_dbg = {"predicted_kv_cache_bytes": pred, **dbg}
+
+        # 注意：不要在持锁期间 acquire sema（避免卡死）
+        await sema.acquire()
+        item.start_event.set()

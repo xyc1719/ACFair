@@ -54,7 +54,7 @@ async def schedule_one(client: httpx.AsyncClient, sem: asyncio.Semaphore, i: int
 
 
 async def main():
-    df = pd.read_csv(CSV_PATH, nrows=3000)
+    df = pd.read_csv(CSV_PATH, nrows=200)
 
     if "Timestamp" not in df.columns:
         raise ValueError(f"Can't find the column named 'Timestamp' in CSV。当前列: {list(df.columns)}")
@@ -68,7 +68,7 @@ async def main():
         tasks = []
         for idx, t in enumerate(ts):
             # default (t - t0) / 100
-            delay_s = (t - t0) / 1000.0
+            delay_s = (t - t0) / 1000
             tasks.append(asyncio.create_task(schedule_one(client, sem, idx, delay_s)))
 
         await asyncio.gather(*tasks)

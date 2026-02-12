@@ -87,6 +87,15 @@ asyncio/await 为轮询实现，伪多线程，不存在写入竞争，over。
 
 ## 准入队列
 
+QueueItem + dispatcher(Item in / finish) + deadline_tick(50 ms recall dispatcher)
+
+`dispatcher_loop`仅需在新请求进队和请求完成时，检查准入可行性。
+
+`deadline_tick`定期清除等待超时的请求。
+
+对于新任务，先进队再敲钟，若超时则直接返回，否则正常执行 `stream_generator(item)`
+
+**TODO**:*超时等待时间可以用TTFT estimator优化*
 
 ---
 
@@ -95,7 +104,7 @@ asyncio/await 为轮询实现，伪多线程，不存在写入竞争，over。
 - +变长prompt
   - 对应数据集
   - 早停策略或WildChat
-  - 
+  - 合成Prompt
 - -用户标签合成
   - 好的分布
   - 分析论证的文档（英文两段），附带引用文献
@@ -103,3 +112,20 @@ asyncio/await 为轮询实现，伪多线程，不存在写入竞争，over。
 - +动态TPM (优化策略的实现)，测试
 - 针对4个指标，记录实验结果并优化
 - outline流程示意图
+
+# 0212
+
+## TODOLIST
+
+- 合成prompt 2
+- 准入队列 3
+- VTC策略实现 2
+- TPM策略实现 1
+- *用户标签合成 3
+- 动态TPM策略实现 3
+
+## 合成Prompt
+
+Draft:对于这类缺少对应Prompt的数据，通用的做法是合成。合成input len等长的Prompt，拒绝EOS早停，并限制对单个request限制最大output len
+
+## TPM策略实现
