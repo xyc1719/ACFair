@@ -112,6 +112,7 @@ def estimate_kv_bytes_per_block(
 
 def estimate_tokens(text: str) -> int:
     """非常粗略的 token 估算：按空白分词计数。"""
+    # TODO: tokenizer 级别的准确估算，但性能太差
     if not text:
         return 0
     return len(text.split())

@@ -120,7 +120,7 @@ QueueItem + dispatcher(Item in / finish) + deadline_tick(50 ms recall dispatcher
 - 准入队列 3 over
 - VTC策略实现 2 over
 - TPM策略实现 1 over
-- 合成prompt 2
+- 合成prompt
 - *用户标签合成 3
 - 动态TPM策略实现 3
 
@@ -142,11 +142,24 @@ QueueItem + dispatcher(Item in / finish) + deadline_tick(50 ms recall dispatcher
 
 ---
 
+## 0213
+
+## TODOLIST
+
+- 合成Prompt 1.5
+- 用户标签合成 3
+- 1400
+- log&周报
+  - 实验进度
+  - 用户标签合成-分析报告
+  - 推辞
+  - 未来工作方向
+
 ## 合成Prompt
 
-Draft:对于这类缺少对应Prompt的数据，通用的做法是合成。合成input len等长的Prompt，拒绝EOS早停，并限制对单个request限制最大output len
+对于这类缺少对应Prompt的数据，通用的做法是合成。并限制对单个request限制最大output len
 
-load_gen调整,*vllm启动参数调整*
+load_gen调整,合成input len等长的Prompt，拒绝EOS早停，并限制对单个request限制max_tokens和min_tokens.
 
 ## 用户标签合成
 
