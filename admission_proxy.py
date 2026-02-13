@@ -226,7 +226,7 @@ async def admit_or_reject(body: dict, prompt_tokens: int,pred: int = None) -> tu
     global reserved_kv_bytes
 
     if pred is None:
-        pred = historical_KVcache_estimator(prompt_tokens, body.get("max_tokens", 2048))
+        pred = historical_KVcache_estimator(prompt_tokens, 2048)
 
     usage = await get_kv_cache_usage_ratio()
     if usage is None:
@@ -357,6 +357,7 @@ async def dispatcher_loop_TPM():
             continue
 
 async def dispatcher_loop_VTC():
+    #TODO: **已知bug**： *load_gen.py启动两次，第一次绝大部分请求被接受，第二次绝大部分请求都被拒绝了。*
     global seq_counter
     while True:
         print("alive tick...")
@@ -380,9 +381,10 @@ async def dispatcher_loop_VTC():
                 continue
 
             # check admit or reject
-            selected_idx = 0
+            selected_idx = None
             min_VTC = 1<<32
-            for i in range(len(pending_queue)):
+            i = 0
+            while i < len(pending_queue):
                 arrival_ms, ddl_ms, item = pending_queue[i]
                 user_id = item.body.get("user")
                 if not user_id:
@@ -394,6 +396,7 @@ async def dispatcher_loop_VTC():
                 if(get_user_VTC(user_id)<min_VTC):
                     selected_idx=i
                     min_VTC = get_user_VTC(user_id)
+                i += 1
             arrival_ms, ddl_ms,item = pending_queue[selected_idx]
             # check admit or reject
             admitted, pred, dbg = await admit_or_reject(item.body, item.input_tokens_est,item.predicted_kv_bytes)
@@ -407,8 +410,9 @@ async def dispatcher_loop_VTC():
             item.admitted_dbg = {"predicted_kv_cache_bytes": pred, **dbg}
 
         #setup stream generator
-        await sema.acquire()
-        item.start_event.set()
+        if selected_idx is not None and admitted:
+            await sema.acquire()
+            item.start_event.set()
                  
 
 async def deadline_tick():
@@ -468,7 +472,7 @@ async def chat_completions(req: Request):
         body=body,
         arrival_ms=now_ms(),
         input_tokens_est=estimate_tokens(body.get("messages", [{}])[0].get("content", "")),
-        predicted_kv_bytes=historical_KVcache_estimator(estimate_tokens(body.get("messages", [{}])[0].get("content", "")), body.get("max_tokens", 2048))
+        predicted_kv_bytes=historical_KVcache_estimator(estimate_tokens(body.get("messages", [{}])[0].get("content", "")),2048)
     )
     # new request enqueue and notify dispatcher
     global seq_counter
@@ -483,7 +487,7 @@ async def chat_completions(req: Request):
         user_id = body.get("user")
         #new user, align the VTC to minimal active user.
         get_user_VTC(user_id)
-        if user_VTC_stats[body.get("user")]["active"]== 0:
+        if user_VTC_stats[user_id]["active"]== 0:
             set_user_VTC(user_id,get_min_user_VTC())
         pending_queue.append((now_ms(), now_ms() + DEFAULT_QUEUE_WAIT_MS, item))
         seq_counter += 1
@@ -497,23 +501,24 @@ async def chat_completions(req: Request):
         first_chunk_time = None
         last_chunk_time = None
         chunk_intervals_ms = []
-        user_id = None
+        user_id = body.get("user", None)
         kv_cache_bytes_est = 0
         input_tokens_est = 0
+
+        user_VTC_stats[user_id]['active']+=1
+
+        #基于历史的KV cache 估算 P90/P95
+        peak_kv_cache_est = item.predicted_kv_bytes
+        reserved_remaining = peak_kv_cache_est
+        input_tokens_est = item.input_tokens_est
+        kv_cache_bytes_est = int(input_tokens_est * KV_CACHE_BYTES_PER_TOKEN)
+        # record input tokens immediately
+        record_user_tokens(user_id, input_tokens=input_tokens_est)
+        record_user_KV_cache(user_id, kv_cache_bytes=kv_cache_bytes_est)
+        record_user_TPM(user_id, input_tokens_est)
+        record_user_VTC(user_id, input_tokens_est)
         
         try:
-            # extract user id
-            user_id = body.get("user")
-            #基于历史的KV cache 估算 P90/P95
-            peak_kv_cache_est = item.predicted_kv_bytes
-            input_tokens_est = item.input_tokens_est
-            kv_cache_bytes_est = int(input_tokens_est * KV_CACHE_BYTES_PER_TOKEN)
-            # record input tokens immediately
-            record_user_tokens(user_id, input_tokens=input_tokens_est)
-            record_user_KV_cache(user_id, kv_cache_bytes=kv_cache_bytes_est)
-            record_user_TPM(user_id, input_tokens_est)
-            record_user_VTC(user_id, input_tokens_est)
-            user_VTC_stats[user_id]['active']+=1
 
             async with client.stream(
                 "POST",
@@ -523,7 +528,13 @@ async def chat_completions(req: Request):
             ) as r:
                 # report HTTPError if status code from vllm is not 2xx
                 r.raise_for_status()
-
+                
+                # update reserved KV cache with input tokens
+                async with reserved_lock:
+                    delta  = min(reserved_remaining , kv_cache_bytes_est)
+                    reserved_kv_bytes -= delta
+                    reserved_remaining -= delta
+                
                 async for line in r.aiter_lines():
                     if not line:
                         continue
@@ -550,9 +561,11 @@ async def chat_completions(req: Request):
                                         if content:
                                             out_toks = estimate_tokens(content)
                                             # update reserved KV cache
-                                            if kv_cache_bytes_est < peak_kv_cache_est:
+                                            if reserved_remaining > 0:
                                                 async with reserved_lock:
-                                                    reserved_kv_bytes = max(0,reserved_kv_bytes - min(out_toks * KV_CACHE_BYTES_PER_TOKEN, peak_kv_cache_est - kv_cache_bytes_est))
+                                                    delta = min(reserved_remaining, out_toks * KV_CACHE_BYTES_PER_TOKEN)
+                                                    reserved_kv_bytes = max(0,reserved_kv_bytes - delta)
+                                                    reserved_remaining -= delta
                                             kv_cache_bytes_est += out_toks * KV_CACHE_BYTES_PER_TOKEN
                                             record_user_tokens(user_id, output_tokens=out_toks)
                                             record_user_KV_cache(user_id, out_toks * KV_CACHE_BYTES_PER_TOKEN)
@@ -582,9 +595,10 @@ async def chat_completions(req: Request):
             record_user_KV_cache(user_id, -kv_cache_bytes_est)
             historical_KV_cache.append(kv_cache_bytes_est)
             # release reserved KV cache
-            if kv_cache_bytes_est < peak_kv_cache_est:
+            if reserved_remaining > 0:
                 async with reserved_lock:
-                    reserved_kv_bytes = max(0,reserved_kv_bytes - ( peak_kv_cache_est - kv_cache_bytes_est))
+                    reserved_kv_bytes = max(0,reserved_kv_bytes - reserved_remaining)
+                    print("released reserved KV bytes, now reserved =", reserved_kv_bytes)
 
             end = time.perf_counter()
             ttft_ms = None if first_chunk_time is None else (first_chunk_time - start) * 1000

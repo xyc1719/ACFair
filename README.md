@@ -57,3 +57,9 @@ max GPU KV cache size: 229,888 tokens
 max num of GPU blocks: 14368
 
 上下文长度和最大并行请求，同时影响KV capacity需求和计算图等其他开销。
+
+## TODOLIST
+
+- fix `reserved_kv_bytes` leaking.
+- dynamic TPM policy
+- adjust env setup to empathsize our work.
