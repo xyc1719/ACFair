@@ -85,20 +85,20 @@ async def main():
     if "Timestamp" not in df.columns:
         raise ValueError(f"Can't find the column named 'Timestamp' in CSV。当前列: {list(df.columns)}")
 
-    ts = df["Timestamp"]
-    t0 = ts[0]
+    t0 = df["Timestamp"][0]
 
     sem = asyncio.Semaphore(MAX_INFLIGHT)
 
     async with httpx.AsyncClient(timeout=None, trust_env=False) as client:
         tasks = []
-        for idx, item in enumerate(df.itertuples()):
-            # print(item[3],item[4],item[5]) # Request_tokens, Response_tokens, Total_tokens
+        for idx, row in df.iterrows():
+            in_len = int(row["Request tokens"])
+            out_len = int(row["Response tokens"])
             # default (t - t0) / 100
-            delay_s = (item.Timestamp - t0) / 1000
-            if item [3]==0 and item[4]==0:
+            delay_s = (row["Timestamp"] - t0) / 1000.0
+            if in_len == 0 and out_len == 0:
                 continue
-            tasks.append(asyncio.create_task(schedule_one(client, sem, idx,{"input_len": item[3], "output_len": item[4]}, delay_s)))
+            tasks.append(asyncio.create_task(schedule_one(client, sem, idx, {"input_len": in_len, "output_len": out_len}, delay_s)))
 
         await asyncio.gather(*tasks)
 
