@@ -63,3 +63,4 @@ max num of GPU blocks: 14368
 - fix `reserved_kv_bytes` leaking.
 - dynamic TPM policy
 - adjust env setup to empathsize our work.
+- 4 metrics evaluation( metrics in outline ver.0.1)

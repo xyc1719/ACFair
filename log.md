@@ -73,7 +73,7 @@ asyncio/await 为轮询实现，伪多线程，不存在写入竞争，over。
 
 非防止临时大量请求准入，导致KV cache占用偏差，引入reserved_kv_cache占位并随request处理而更新。**隐含风险**：reserved_lock同步速度较慢。
 
-可行性准入条件为free- headroom -reserved >= pred。
+可行性准入条件为`free - headroom - reserved >= pred`。
 
 ### 测试
 
@@ -176,7 +176,6 @@ arxiv data storage fair -> twitter/... 分布分析，学习分析思路
 类似LLM serving 用户请求分布 --> BurstGPT 3.2 user pattern figure.7
 
 分布类型 zipf，无明确参数。
-
 
 ## DEBUG
 
